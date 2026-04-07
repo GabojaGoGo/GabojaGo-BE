@@ -46,6 +46,27 @@ tripmate/
 
 ## 핵심 규칙
 
+### 환경 파일 보안 ⚠️
+**절대 커밋하면 안 됨:**
+- `.env` — DB, 카카오 키, JWT 시크릿, TOUR_API 키
+- `.env.imac` — 로컬 개발 환경 변수 (민감한 정보)
+- `.env.tailscale` — Tailscale VPN 환경 변수
+
+**Git 관리:**
+```bash
+# .gitignore에 이미 추가됨
+.env
+.env.local
+.env.imac
+.env.tailscale
+.env.*.local
+```
+
+**안전한 방법:**
+1. 로컬에서만 `.env` 파일 생성 (git 추적 안 됨)
+2. 변수 템플릿은 `.env.example` 사용
+3. 팀원과 환경 변수 공유 시 별도 채널 사용
+
 ### 네트워크 / 멀티 환경
 | ENV 플래그 | .env 파일 | API_BASE_URL | 용도 |
 |-----------|----------|-------------|------|
