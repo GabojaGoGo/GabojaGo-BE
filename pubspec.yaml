@@ -1,0 +1,48 @@
+name: tripmate
+description: "가보자GO — 취향 기반 AI 여행 플래너"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_staggered_grid_view: ^0.7.0
+  shared_preferences: ^2.3.2
+  http: ^1.2.1
+  geolocator: ^11.0.0
+  geocoding: ^3.0.0
+  flutter_map: ^6.1.0
+  latlong2: ^0.9.0
+  kakao_maps_flutter: ^0.1.2
+  flutter_dotenv: ^5.1.0
+  url_launcher: ^6.3.0
+  flutter_secure_storage: ^9.2.2
+  app_links: ^6.3.3
+  flutter_local_notifications: ^18.0.0
+  timezone: ^0.9.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_launcher_icons: ^0.13.1 # <--- 여기에 추가됨
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - .env
+    - .env.imac
+    - .env.tailscale
+    - assets/images/app_icon.png
+
+# 앱 아이콘 설정 (파일 맨 아래에 독립적으로 위치해야 함)
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/images/app_icon.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/images/app_icon.png"
