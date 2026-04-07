@@ -30,7 +30,12 @@ migrate_working_dir/
 .flutter-plugins-dependencies
 .pub-cache/
 .pub/
+# Environment 파일 (민감한 정보: API 키, 데이터베이스 자격증명 등)
 .env
+.env.local
+.env.imac
+.env.tailscale
+.env.*.local
 /build/
 /coverage/
 
