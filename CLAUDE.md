@@ -94,7 +94,7 @@ ssh imac "cd ~/tripmate/backend && docker compose up --build -d"
 GET  /api/spots?lat=&lng=&limit=     # 주변관광지 (기본10, 지도100)
 GET  /api/spots/congestion?lat=&lng=&limit=
 GET  /api/festivals?lat=&lng=
-GET  /api/courses?purposes=&duration= # 앵커 기반 코스 추천 (앵커 선정→fetchNearby→슬롯 배치→Nearest Neighbor 최적화, places+dayLabel+slotType 포함)
+GET  /api/courses?purposes=&duration=&lat=&lng= # 앵커 기반 코스 추천 (앵커 선정→fetchNearby→슬롯 배치→Nearest Neighbor 최적화, places+dayLabel+slotType 포함; lat/lng 시 거리+복합점수 정렬)
 GET  /api/courses/{contentId}/detail?purposes=  # 코스 상세 (anchor_/custom_ prefix면 즉시 빈 반환; 일반은 detailIntro2+detailInfo2+detailCommon2 병렬; food→주변맛집, resort→주변숙박 via Kakao Local)
 GET  /me/prefs                       # 취향 조회
 PUT  /me/prefs                       # 취향 저장
@@ -136,23 +136,36 @@ static Future<T> getSomething(params) async {
 
 ### 앵커 포인트 기반 코스 추천 (CourseService v2)
 - **앵커 시스템**: 전국 25개 여행 거점 (`ANCHORS` 상수), 각 앵커에 (이름, 위경도, areaCode, purposes, tags) 정의
-- **앵커 선정**: `selectAnchors()` — matchScore(purpose 매칭도) 내림차순 + 같은 시도 최대 2개 + 50km 거리 제한으로 다양성 보장
+- **앵커 선정 및 정렬**: `selectAnchors(purposes, count, userLat, userLng)`
+  - 기본: matchScore(purpose 매칭도) 내림차순
+  - 사용자 위치 제공 시: `computeAnchorScore()` = matchScore×70% + distanceScore×30%
+  - distanceScore: 선형 감소 (300km=0점) → `Math.max(0, 30 * (1 - dist/300))`
+  - 다양성 보장: 같은 시도 최대 2개 + 50km 거리 제한
+- **카테고리 필터링**:
+  - **MEAL**: Kakao Local FD6 categoryName 기반 필터링
+    - 제외: 베이커리, 파스트푸드, 도넛, 디저트, 아이스크림, 주점, 바 등
+    - 우선: 한식(+5점), 양식/해산물/고기 등 화이트리스트 매칭(+10점/개)
+  - **LODGING**: 취향별 필터링
+    - resort+food: 호텔/리조트/펜션 우선, 모텔/여관 제외
+    - budget: 게스트하우스/모텔/민박/한옥/호스텔 우선
 - **슬롯 템플릿**: `TEMPLATES` — duration별 DAY 단위 일정 구성 (SIGHT→MEAL→SIGHT→MEAL→LODGING 패턴)
   - day: 5슬롯(1DAY), 1n2d: 9슬롯(2DAY), 2n3d: 14슬롯(3DAY), 3nplus: 19슬롯(4DAY)
   - LODGING은 각 DAY 마지막 (마지막 DAY 제외), 당일치기는 LODGING 없음
 - **장소 수집**: `fetchWithFallback()` — TourAPI `fetchNearby()` + Kakao Local 병렬 호출
   - SIGHT: TourAPI fetchNearby (반경 30km, contentType별 50개)
-  - MEAL: Kakao Local FD6 (반경 15km, 15개)
-  - LODGING: Kakao Local AD5 (반경 20km, 10개)
-  - 폴백: 부족 시 반경 50km 확대 → TourAPI 음식점(39)/숙박(32) 대체
+  - MEAL: Kakao Local FD6 (반경 15km, 15개) + 카테고리 필터링
+  - LODGING: Kakao Local AD5 (반경 20km, 10개) + 취향별 필터링
+  - 폴백: 부족 시 반경 50km 확대 → TourAPI 음식점(39)/숙박(32) (필터링 적용)
 - **동선 최적화**: `optimizeRoute()` — Nearest Neighbor 휴리스틱
   - DAY 단위 처리, 현재 위치에서 가장 가까운 미방문 장소 배치
   - LODGING은 DAY 중심(무게중심)에서 가장 가까운 숙소
 - **DTO**: `SubPlace`에 `dayLabel`("DAY 1"), `timeLabel`("morning"/"lunch"등), `slotType`("sight"/"meal"/"lodging") 추가
 - contentId 형식: `"anchor_{앵커이름}_{purposes}"` — `getCourseDetail()`에서 `startsWith("anchor_")` 또는 `startsWith("custom_")`이면 빈 detail 반환
 - **장소 스코어링**: 이미지(+10), 주소(+5), 좌표(+5), 취향 키워드 매칭(+3/개, 제목+주소 결합) → `scoredItems()`, `computeScore()`
-- `travel_course_result_screen.dart`: `relevanceScore >= 100`이면 "복합 취향 최적" 뱃지 Chip, 장소 미리보기(`_PlacesPreview`) DAY별 표시
+- **코스 점수** (relevanceScore): `computeAnchorScore()` = matchScore×70 + distanceScore×30 (사용자 위치 기반 동적 계산)
+- `travel_course_result_screen.dart`: `relevanceScore >= 70`이면 "복합 취향 최적" 뱃지 Chip, 장소 미리보기(`_PlacesPreview`) DAY별 표시
 - `course_detail_screen.dart`: `_DayDivider` DAY 구분 헤더, 슬롯타입별 아이콘·색상 (sight=초록, meal=주황, lodging=보라)
+- **Flutter 연동**: `course_loading_screen.dart`에서 현재 위치(lat/lng) 자동 수집 → `ApiService.getCourses(purposes, duration, lat, lng)`
 
 ### 코스 상세 로딩 패턴
 - `ApiService.getCoursesWithDetail()` — 코스 목록 + 각 상세(places/distance/taketime) 병렬 프리패치
@@ -184,6 +197,31 @@ spot.copyWith(congestion: ..., congestionSource: ...)  // 혼잡도 병합
 - `is_repeatable=true`: 버튼 항상 활성, "총 N회 이용 기록" 표시 (BenefitReport의 benefitId로 카운트)
 - `is_repeatable=false`: 완료 후 비활성 회색 버튼 "신청 완료 ✓"
 - DB 마이그레이션: V11(korail_spring apply_url), V12(is_repeatable 컬럼 + sale_festa/gift_voucher/korail_spring=1)
+
+### 지역사랑 휴가지원 크롤링 (VacationSupportSyncScheduler)
+- **자동 스케줄**: 매일 오전 6시 (한국 시간) 실행
+  - `@Scheduled(cron = "0 0 6 * * *", zone = "Asia/Seoul")`
+  - `VacationSupportCrawler.crawl()` → visitkorea 페이지 크롤링
+- **크롤링 로직** (VacationSupportCrawler):
+  - 대상: `https://korean.visitkorea.or.kr/dgtourcard/tour50.do`
+  - Jsoup 사용, userAgent 설정 (브라우저 차단 회피)
+  - href에 `func_go_detail` 포함하는 `<a>` 태그 추출
+  - 링크 텍스트에서 지역명 + 상태 파싱 (예: "밀양신청접수중" → "밀양": "신청접수중")
+  - 인식 상태: "신청접수중" | "준비중" | "마감"
+- **DB 업데이트** (VacationSupportSyncScheduler.sync()):
+  - Benefit(id="vacation_support")의 detailJson 조회
+  - regions[].status 필드를 크롤링 결과로 업데이트
+  - 실패 시: 로그만 남기고 기존 데이터 유지 (신뢰성 보장)
+- **수동 동기화**: `POST /api/benefits/sync/vacation-support` (관리자용)
+- **detailJson 구조**:
+  ```json
+  {
+    "regions": [
+      { "name": "경남 밀양", "status": "신청접수중", "link": "..." },
+      { "name": "부산 해운대", "status": "마감", "link": "..." }
+    ]
+  }
+  ```
 
 ### 주변 관광지 검색 범위
 - 백엔드: `SPOT_RADIUS_METER = 20000` (20km)
