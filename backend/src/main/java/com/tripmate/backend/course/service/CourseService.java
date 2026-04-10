@@ -169,11 +169,30 @@ public class CourseService {
 
     private List<Anchor> selectAnchors(List<String> purposes, int count,
                                         Double userLat, Double userLng) {
+        return selectAnchors(purposes, count, userLat, userLng, null);
+    }
+
+    private List<Anchor> selectAnchors(List<String> purposes, int count,
+                                        Double userLat, Double userLng,
+                                        String preferredAnchorName) {
         List<Anchor> selected = new ArrayList<>();
         Map<String, Integer> areaCount = new HashMap<>();
 
+        // 선호 앵커가 있으면 먼저 고정
+        if (preferredAnchorName != null && !preferredAnchorName.isBlank()) {
+            ANCHORS.stream()
+                    .filter(a -> a.name().equals(preferredAnchorName) && a.matchScore(purposes) > 0)
+                    .findFirst()
+                    .ifPresent(preferred -> {
+                        selected.add(preferred);
+                        areaCount.put(preferred.areaCode(), 1);
+                        log.info("Pinned preferred anchor: {}", preferred.name());
+                    });
+        }
+
         List<Anchor> candidates = new ArrayList<>(ANCHORS.stream()
                 .filter(a -> a.matchScore(purposes) > 0)
+                .filter(a -> selected.isEmpty() || !a.name().equals(selected.get(0).name()))
                 .sorted(Comparator.comparingDouble((Anchor a) ->
                                 -computeAnchorScore(a, purposes, userLat, userLng))
                         .thenComparing(a -> ThreadLocalRandom.current().nextDouble()))
@@ -201,10 +220,23 @@ public class CourseService {
     // Phase 3: 주변 장소 수집 (fetchNearby 기반)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    /** 수집 결과를 담는 컨테이너 */
+    /** 식사 시간대 컨텍스트 (TPO 필터링용) */
+    public enum MealTimeContext { BREAKFAST, LUNCH, DINNER, GENERAL }
+
+    private static MealTimeContext mealCtx(String timeLabel) {
+        if (timeLabel == null) return MealTimeContext.GENERAL;
+        return switch (timeLabel) {
+            case "morning" -> MealTimeContext.BREAKFAST;
+            case "lunch"   -> MealTimeContext.LUNCH;
+            case "dinner"  -> MealTimeContext.DINNER;
+            default        -> MealTimeContext.GENERAL;
+        };
+    }
+
+    /** 수집 결과를 담는 컨테이너 (식사는 시간대별로 사전 필터링) */
     private record PlacePool(
             List<TourApiResponse.Item> sights,
-            List<KakaoLocalClient.KakaoPlace> meals,
+            Map<MealTimeContext, List<KakaoLocalClient.KakaoPlace>> mealsByCtx,
             List<KakaoLocalClient.KakaoPlace> lodgings
     ) {}
 
@@ -234,9 +266,14 @@ public class CourseService {
                             anchor.lng(), anchor.lat(), LODGING_RADIUS, 10))
                 : CompletableFuture.completedFuture(List.of());
 
+        List<KakaoLocalClient.KakaoPlace> rawMeals = mealFuture.join();
+        Map<MealTimeContext, List<KakaoLocalClient.KakaoPlace>> mealsByCtx = new HashMap<>();
+        for (MealTimeContext ctx : MealTimeContext.values()) {
+            mealsByCtx.put(ctx, filterMeals(rawMeals, purposes, ctx));
+        }
         return new PlacePool(
                 sightFuture.join(),
-                filterMeals(mealFuture.join(), purposes),
+                mealsByCtx,
                 filterLodgings(lodgingFuture.join(), purposes));
     }
 
@@ -250,7 +287,9 @@ public class CourseService {
         int lodgingNeed = (int) slots.stream().filter(s -> s.type() == SlotType.LODGING).count();
 
         List<TourApiResponse.Item> sights = new ArrayList<>(pool.sights());
-        List<KakaoLocalClient.KakaoPlace> meals = new ArrayList<>(pool.meals());
+        // GENERAL 컨텍스트(가장 느슨한 필터) 기준으로 부족 여부 판단 + 폴백 추가
+        List<KakaoLocalClient.KakaoPlace> meals = new ArrayList<>(
+                pool.mealsByCtx().getOrDefault(MealTimeContext.GENERAL, List.of()));
         List<KakaoLocalClient.KakaoPlace> lodgings = new ArrayList<>(pool.lodgings());
 
         // Level 1: SIGHT 부족 → 반경 50km로 관광지(12) 재검색
@@ -288,7 +327,12 @@ public class CourseService {
             }
         }
 
-        return new PlacePool(sights, meals, lodgings);
+        // 폴백으로 추가된 meals를 모든 ctx에 다시 필터링해 재분배
+        Map<MealTimeContext, List<KakaoLocalClient.KakaoPlace>> mealsByCtx = new HashMap<>();
+        for (MealTimeContext ctx : MealTimeContext.values()) {
+            mealsByCtx.put(ctx, filterMeals(meals, purposes, ctx));
+        }
+        return new PlacePool(sights, mealsByCtx, lodgings);
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -340,8 +384,15 @@ public class CourseService {
                         yield new PlacedSlot(slot, null, null, null, 0, 0);
                     }
                     case MEAL -> {
+                        MealTimeContext ctx = mealCtx(slot.timeLabel());
+                        List<KakaoLocalClient.KakaoPlace> mealCandidates =
+                                pool.mealsByCtx().getOrDefault(ctx, List.of());
+                        if (mealCandidates.isEmpty()) {
+                            mealCandidates = pool.mealsByCtx()
+                                    .getOrDefault(MealTimeContext.GENERAL, List.of());
+                        }
                         KakaoLocalClient.KakaoPlace nearest = findNearestKakao(
-                                pool.meals(), curLat, curLng, usedMealIds);
+                                mealCandidates, curLat, curLng, usedMealIds);
                         if (nearest != null) {
                             usedMealIds.add(nearest.name() + nearest.x() + nearest.y());
                             yield new PlacedSlot(slot, nearest.name(), null,
@@ -351,10 +402,12 @@ public class CourseService {
                         yield new PlacedSlot(slot, null, null, null, 0, 0);
                     }
                     case LODGING -> {
-                        // 숙박: DAY에 배치된 장소들의 무게중심에서 가장 가까운 숙소
-                        double[] center = centroid(dayPlaced);
+                        // 숙박: DAY의 마지막 비숙박 일정 좌표 기준으로 가장 가까운 숙소
+                        PlacedSlot last = lastNonLodgingWithPlace(dayPlaced);
+                        double refLat = last != null ? last.lat() : curLat;
+                        double refLng = last != null ? last.lng() : curLng;
                         KakaoLocalClient.KakaoPlace nearest = findNearestKakao(
-                                pool.lodgings(), center[0], center[1], usedLodgingIds);
+                                pool.lodgings(), refLat, refLng, usedLodgingIds);
                         if (nearest != null) {
                             usedLodgingIds.add(nearest.name() + nearest.x() + nearest.y());
                             yield new PlacedSlot(slot, nearest.name(), null,
@@ -371,9 +424,74 @@ public class CourseService {
                 }
                 dayPlaced.add(placed);
             }
+            // SIGHT 시퀀스 2-opt 후처리 (교차 제거)
+            applyTwoOptOnSights(dayPlaced, anchor.lat(), anchor.lng());
             result.addAll(dayPlaced);
         }
         return result;
+    }
+
+    /** DAY 내 SIGHT 슬롯만 추출해 2-opt로 교차 제거 후 원래 인덱스에 재삽입 */
+    private void applyTwoOptOnSights(List<PlacedSlot> dayPlaced, double startLat, double startLng) {
+        List<Integer> sightIdx = new ArrayList<>();
+        for (int i = 0; i < dayPlaced.size(); i++) {
+            PlacedSlot p = dayPlaced.get(i);
+            if (p.slot().type() == SlotType.SIGHT && p.hasPlace()) sightIdx.add(i);
+        }
+        if (sightIdx.size() < 3) return;
+
+        List<PlacedSlot> seq = new ArrayList<>();
+        for (int idx : sightIdx) seq.add(dayPlaced.get(idx));
+
+        boolean improved = true;
+        int guard = 0;
+        while (improved && guard++ < 20) {
+            improved = false;
+            for (int i = 0; i < seq.size() - 1; i++) {
+                for (int j = i + 1; j < seq.size(); j++) {
+                    double before = totalDistance(seq, startLat, startLng);
+                    Collections.reverse(seq.subList(i, j + 1));
+                    double after = totalDistance(seq, startLat, startLng);
+                    if (after + 1e-6 < before) {
+                        improved = true;
+                    } else {
+                        Collections.reverse(seq.subList(i, j + 1));
+                    }
+                }
+            }
+        }
+
+        for (int k = 0; k < sightIdx.size(); k++) {
+            int idx = sightIdx.get(k);
+            PlacedSlot original = dayPlaced.get(idx);
+            PlacedSlot reordered = seq.get(k);
+            dayPlaced.set(idx, new PlacedSlot(
+                    original.slot(),
+                    reordered.name(),
+                    reordered.imageUrl(),
+                    reordered.address(),
+                    reordered.lat(),
+                    reordered.lng()));
+        }
+    }
+
+    private double totalDistance(List<PlacedSlot> seq, double startLat, double startLng) {
+        double total = 0;
+        double lat = startLat, lng = startLng;
+        for (PlacedSlot p : seq) {
+            total += haversine(lat, lng, p.lat(), p.lng());
+            lat = p.lat();
+            lng = p.lng();
+        }
+        return total;
+    }
+
+    private PlacedSlot lastNonLodgingWithPlace(List<PlacedSlot> placed) {
+        for (int i = placed.size() - 1; i >= 0; i--) {
+            PlacedSlot p = placed.get(i);
+            if (p.slot().type() != SlotType.LODGING && p.hasPlace()) return p;
+        }
+        return null;
     }
 
     private TourApiResponse.Item findNearestSight(List<TourApiResponse.Item> pool,
@@ -392,14 +510,6 @@ public class CourseService {
                 .filter(p -> p.x() != 0 && p.y() != 0)
                 .min(Comparator.comparingDouble(p -> haversine(lat, lng, p.y(), p.x())))
                 .orElse(null);
-    }
-
-    private double[] centroid(List<PlacedSlot> placed) {
-        List<PlacedSlot> valid = placed.stream().filter(PlacedSlot::hasPlace).toList();
-        if (valid.isEmpty()) return new double[]{0, 0};
-        double avgLat = valid.stream().mapToDouble(PlacedSlot::lat).average().orElse(0);
-        double avgLng = valid.stream().mapToDouble(PlacedSlot::lng).average().orElse(0);
-        return new double[]{avgLat, avgLng};
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -424,6 +534,37 @@ public class CourseService {
             "전통", "향토", "스테이크"
     );
 
+    // ── TPO 시간대별 사전 (Phase A) ──────────────────────
+    /** 아침 슬롯 우선 카테고리 (가벼운 한끼) */
+    private static final List<String> BREAKFAST_WHITELIST = List.of(
+            "죽","해장국","콩나물국밥","순두부","북엇국","선지국","곰탕",
+            "토스트","샌드위치","베이커리","브런치"
+    );
+    /** 아침 슬롯 제외 카테고리 (무거운 정찬/회/뷔페) */
+    private static final List<String> BREAKFAST_BLACKLIST = List.of(
+            "갈비","삼겹살","스테이크","고깃집","회","초밥","한정식","뷔페"
+    );
+    /** 아침 슬롯에서는 ALWAYS 블랙리스트 중 예외 허용 */
+    private static final List<String> BREAKFAST_ALWAYS_EXEMPT = List.of(
+            "베이커리","브런치","토스트","샌드위치"
+    );
+
+    /** 점심 슬롯 우선 카테고리 */
+    private static final List<String> LUNCH_WHITELIST = List.of(
+            "한식","백반","국밥","비빔밥","냉면","칼국수","돈가스",
+            "라멘","우동","파스타","덮밥","쌀국수"
+    );
+
+    /** 저녁 슬롯 우선 카테고리 (정찬/고기/회) */
+    private static final List<String> DINNER_WHITELIST = List.of(
+            "갈비","삼겹살","고깃집","스테이크","한정식","회","초밥",
+            "전복","장어","오리","샤브샤브","이탈리아","프랑스"
+    );
+    /** 저녁 슬롯 제외 (분식/김밥/토스트류) */
+    private static final List<String> DINNER_BLACKLIST = List.of(
+            "분식","김밥","토스트","샌드위치"
+    );
+
     /** resort(편안한 숙소) 우선 카테고리 */
     private static final List<String> LODGING_RESORT_WHITELIST = List.of(
             "호텔", "리조트", "펜션", "풀빌라", "글램핑", "콘도"
@@ -440,14 +581,34 @@ public class CourseService {
     );
 
     private List<KakaoLocalClient.KakaoPlace> filterMeals(
-            List<KakaoLocalClient.KakaoPlace> raw, List<String> purposes) {
+            List<KakaoLocalClient.KakaoPlace> raw, List<String> purposes, MealTimeContext ctx) {
         boolean isFoodPurpose = purposes.contains("food");
+        List<String> ctxWhitelist = switch (ctx) {
+            case BREAKFAST -> BREAKFAST_WHITELIST;
+            case LUNCH     -> LUNCH_WHITELIST;
+            case DINNER    -> DINNER_WHITELIST;
+            case GENERAL   -> List.of();
+        };
+        List<String> ctxBlacklist = switch (ctx) {
+            case BREAKFAST -> BREAKFAST_BLACKLIST;
+            case DINNER    -> DINNER_BLACKLIST;
+            default        -> List.of();
+        };
         return raw.stream()
                 .filter(p -> {
                     String cat = p.categoryName() == null ? "" : p.categoryName();
                     String name = p.name() == null ? "" : p.name();
                     String combined = cat + " " + name;
-                    return MEAL_BLACKLIST_ALWAYS.stream().noneMatch(combined::contains);
+                    // ALWAYS 블랙리스트 (BREAKFAST는 일부 예외 허용)
+                    for (String bad : MEAL_BLACKLIST_ALWAYS) {
+                        if (!combined.contains(bad)) continue;
+                        if (ctx == MealTimeContext.BREAKFAST
+                                && BREAKFAST_ALWAYS_EXEMPT.contains(bad)) continue;
+                        return false;
+                    }
+                    // ctx 블랙리스트
+                    if (ctxBlacklist.stream().anyMatch(combined::contains)) return false;
+                    return true;
                 })
                 .sorted(Comparator.comparingInt((KakaoLocalClient.KakaoPlace p) -> {
                     String cat = p.categoryName() == null ? "" : p.categoryName();
@@ -456,6 +617,7 @@ public class CourseService {
                         score += (int) MEAL_FOOD_WHITELIST.stream()
                                 .filter(cat::contains).count() * 10;
                     }
+                    score += (int) ctxWhitelist.stream().filter(cat::contains).count() * 10;
                     if (cat.contains("한식")) score += 5;
                     return -score;
                 }))
@@ -584,14 +746,20 @@ public class CourseService {
 
     public List<CourseDto> getRecommendedCourses(List<String> purposes, String duration,
                                                    Double userLat, Double userLng) {
+        return getRecommendedCourses(purposes, duration, userLat, userLng, null);
+    }
+
+    public List<CourseDto> getRecommendedCourses(List<String> purposes, String duration,
+                                                   Double userLat, Double userLng,
+                                                   String preferredAnchor) {
         List<String> effectivePurposes = (purposes == null || purposes.isEmpty())
                 ? List.of("nature") : purposes;
         String effectiveDuration = (duration == null || duration.isBlank()) ? "1n2d" : duration;
-        log.info("Anchor-based course recommendation: purposes={}, duration={}",
-                effectivePurposes, effectiveDuration);
+        log.info("Anchor-based course recommendation: purposes={}, duration={}, preferredAnchor={}",
+                effectivePurposes, effectiveDuration, preferredAnchor);
 
-        // 1. 앵커 선정 (다양성 보장)
-        List<Anchor> anchors = selectAnchors(effectivePurposes, MAX_RESULT, userLat, userLng);
+        // 1. 앵커 선정 (선호 앵커 최우선 + 다양성 보장)
+        List<Anchor> anchors = selectAnchors(effectivePurposes, MAX_RESULT, userLat, userLng, preferredAnchor);
         log.info("Selected {} anchors: {}", anchors.size(),
                 anchors.stream().map(Anchor::name).toList());
 
@@ -622,13 +790,26 @@ public class CourseService {
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
-        return futures.stream()
+        List<CourseDto> result = futures.stream()
                 .map(f -> { try { return f.get(); } catch (Exception e) { return null; } })
                 .filter(Objects::nonNull)
                 .filter(c -> c.getPlaces() != null && !c.getPlaces().isEmpty())
                 .sorted(Comparator.comparingInt(CourseDto::getRelevanceScore).reversed())
                 .limit(MAX_RESULT)
                 .collect(Collectors.toList());
+
+        // 선호 앵커 코스를 맨 앞으로 이동 (relevanceScore 재정렬로 밀려난 것 복원)
+        if (preferredAnchor != null && !preferredAnchor.isBlank()) {
+            String prefix = "anchor_" + preferredAnchor.replace(" ", "_") + "_";
+            for (int i = 1; i < result.size(); i++) {
+                if (result.get(i).getContentId().startsWith(prefix)) {
+                    result.add(0, result.remove(i));
+                    log.info("Moved preferred anchor course to top: {}", result.get(0).getContentId());
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
