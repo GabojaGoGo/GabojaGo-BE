@@ -1,5 +1,24 @@
 # 가보자GO — Claude 지침서
 
+## 작업 워크플로우
+
+### 상황별 자동 적용 스킬
+| 상황 | 사용할 접근법 |
+|------|--------------|
+| 새 기능 설계 요청 | `/plan-eng-review`: 데이터 흐름·엣지케이스·테스트 계획 먼저 수립 |
+| 버그·오류 수정 | `/investigate`: 증상→원인→가설→검증, 3회 실패 시 사용자에게 보고 |
+| 코드 작성 완료 후 | `/review`: null safety·N+1·JWT 우회 등 자동 체크 |
+| PR·커밋 요청 | `/ship`: analyze → 테스트 → commit → PR |
+| 인증·보안 관련 변경 | `/cso`: .env 노출·OWASP Top 10·redirect URI 자동 검토 |
+| "테스트해줘" 요청 | `/qa`: 엣지케이스(null lat/lng, 빈 purposes) + 회귀 테스트 |
+| 주간 정리 요청 | `/retro`: git log 7일 기반 분석 |
+
+### 핵심 원칙
+- 구현 전 설계 리뷰 먼저 (ask before build)
+- 버그 수정은 atomic commit + 회귀 테스트 세트로
+- 보안 관련 파일(`.env`, JWT, OAuth) 변경 시 항상 `/cso` 관점으로 검토
+- 3번 디버깅 실패 → 가설 목록과 함께 사용자에게 보고
+
 ## 스택
 - **Frontend**: Flutter ^3.11.4 · Material 3 · `app_links` 딥링크
 - **Backend**: Spring Boot 3.2.4 · Hibernate 6 · Flyway · MySQL (Docker)
@@ -155,7 +174,7 @@ static Future<T> getSomething(params) async {
 4. `TravelCourseResultScreen`: `preloadedCourses != null`이면 즉시 표시 (API 재호출 없음)
 5. 코스 탭 → `CourseDetailScreen`: `course['places'] != null`이면 API 미호출 (커스텀 코스 최적화)
 
-### 앵커 포인트 기반 코스 추천 (CourseService v2)
+### 앵커 포인트 기반 코스 추천 (CourseService v2) + Phase A 개선
 - **앵커 시스템**: 전국 25개 여행 거점 (`ANCHORS` 상수), 각 앵커에 (이름, 위경도, areaCode, purposes, tags) 정의
 - **앵커 선정 및 정렬**: `selectAnchors(purposes, count, userLat, userLng)`
   - 기본: matchScore(purpose 매칭도) 내림차순
@@ -166,6 +185,13 @@ static Future<T> getSomething(params) async {
   - **MEAL**: Kakao Local FD6 categoryName 기반 필터링
     - 제외: 베이커리, 파스트푸드, 도넛, 디저트, 아이스크림, 주점, 바 등
     - 우선: 한식(+5점), 양식/해산물/고기 등 화이트리스트 매칭(+10점/개)
+  - **TPO 식사 필터링** (Phase A):
+    - `MealTimeContext` enum: BREAKFAST/LUNCH/DINNER/GENERAL
+    - `morning` → BREAKFAST(죽/국밥/베이커리 우선, 갈비/한정식/회 제외, 베이커리 예외 허용)
+    - `lunch` → LUNCH(한식/일식/중식/양식 가벼운 한끼)
+    - `dinner` → DINNER(갈비/한정식/회/정찬 우선, 분식/김밥 제외)
+    - `afternoon`/`evening` → GENERAL(ALWAYS 블랙리스트만 적용)
+    - `PlacePool`에 `Map<MealTimeContext, List<KakaoPlace>>` 사전 필터링 저장
   - **LODGING**: 취향별 필터링
     - resort+food: 호텔/리조트/펜션 우선, 모텔/여관 제외
     - budget: 게스트하우스/모텔/민박/한옥/호스텔 우선
@@ -174,12 +200,15 @@ static Future<T> getSomething(params) async {
   - LODGING은 각 DAY 마지막 (마지막 DAY 제외), 당일치기는 LODGING 없음
 - **장소 수집**: `fetchWithFallback()` — TourAPI `fetchNearby()` + Kakao Local 병렬 호출
   - SIGHT: TourAPI fetchNearby (반경 30km, contentType별 50개)
-  - MEAL: Kakao Local FD6 (반경 15km, 15개) + 카테고리 필터링
+  - MEAL: Kakao Local FD6 (반경 15km, 15개) + 시간대별 필터링
   - LODGING: Kakao Local AD5 (반경 20km, 10개) + 취향별 필터링
   - 폴백: 부족 시 반경 50km 확대 → TourAPI 음식점(39)/숙박(32) (필터링 적용)
-- **동선 최적화**: `optimizeRoute()` — Nearest Neighbor 휴리스틱
+- **동선 최적화** (Phase A):
+  - `optimizeRoute()` — Nearest Neighbor 휴리스틱
   - DAY 단위 처리, 현재 위치에서 가장 가까운 미방문 장소 배치
-  - LODGING은 DAY 중심(무게중심)에서 가장 가까운 숙소
+  - **SIGHT 2-opt 후처리**: DAY 내 SIGHT 시퀀스만 추출 → 거리 기반 reverse-swap → 원래 인덱스에 재삽입 (슬롯의 timeLabel/type 보존)
+    - `applyTwoOptOnSights()` — 교차 제거, 가드(20회) 포함
+  - LODGING: 마지막 비숙박 일정 기준(`lastNonLodgingWithPlace()`)에서 가장 가까운 숙소 선택 (기존 무게중심 → 변경)
 - **DTO**: `SubPlace`에 `dayLabel`("DAY 1"), `timeLabel`("morning"/"lunch"등), `slotType`("sight"/"meal"/"lodging") 추가
 - contentId 형식: `"anchor_{앵커이름}_{purposes}"` — `getCourseDetail()`에서 `startsWith("anchor_")` 또는 `startsWith("custom_")`이면 빈 detail 반환
 - **장소 스코어링**: 이미지(+10), 주소(+5), 좌표(+5), 취향 키워드 매칭(+3/개, 제목+주소 결합) → `scoredItems()`, `computeScore()`
